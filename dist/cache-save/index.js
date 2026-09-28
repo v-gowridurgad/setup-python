@@ -97844,6 +97844,35 @@ async function utils_getOSInfo() {
     }
 }
 /**
+ * Suffix appended to the tool cache architecture directory so that Python
+ * builds for different Linux distributions live side by side, e.g.
+ * `x64-ubuntu-24.04`. Returns '' when scoping does not apply, which leaves the
+ * cache layout unchanged.
+ *
+ * Only Linux needs this: `actions/python-versions` publishes a separate Linux
+ * artifact per distro release because those builds link against distro
+ * specific glibc and OpenSSL, while macOS and Windows publish one artifact per
+ * architecture. GitHub-hosted runners are excluded because their tool cache is
+ * pre-baked to match the host image, so scoping would miss every pre-installed
+ * version.
+ */
+async function getToolCacheScopeSuffix() {
+    if (!core.getBooleanInput('scope-cache-by-os') ||
+        !utils_IS_LINUX ||
+        process.env['RUNNER_ENVIRONMENT'] === 'github-hosted') {
+        return '';
+    }
+    // getOSInfo() resolves to undefined if the lookup throws, and VERSION_ID is
+    // absent from /etc/os-release on some minimal images.
+    const osInfo = await utils_getOSInfo();
+    if (!osInfo?.osName || !osInfo.osVersion)
+        return '';
+    // The suffix becomes a directory name; `.` is kept for versions like 24.04.
+    return `${osInfo.osName}-${osInfo.osVersion}`
+        .toLowerCase()
+        .replace(/[^a-z0-9.-]+/g, '-');
+}
+/**
  * Extract a value from an object by following the keys path provided.
  * If the value is present, it is returned. Otherwise undefined is returned.
  */
