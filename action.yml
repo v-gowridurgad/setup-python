@@ -35,6 +35,9 @@ inputs:
   freethreaded:
     description: "When 'true', use the freethreaded version of Python."
     default: false
+  scope-cache-by-os:
+    description: "When 'true', store CPython in an OS-specific tool cache directory (for example 'x64-ubuntu-24.04' instead of 'x64'). Useful on self-hosted Linux runners that run jobs across containers or images with differing distributions, where a Python build for one distribution is not compatible with another. Ignored on GitHub-hosted runners and on non-Linux platforms."
+    default: false
   pip-version:
     description: "Used to specify the version of pip to install with the Python. Supported format: major[.minor][.patch]."
 outputs:
