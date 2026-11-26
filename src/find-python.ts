@@ -1,6 +1,11 @@
 import * as os from 'os';
 import * as path from 'path';
-import {IS_WINDOWS, IS_LINUX, getOSInfo} from './utils.js';
+import {
+  IS_WINDOWS,
+  IS_LINUX,
+  getOSInfo,
+  getToolCacheScopeSuffix
+} from './utils.js';
 
 import * as semver from 'semver';
 
@@ -79,6 +84,13 @@ export async function useCpythonVersion(
     architecture += '-freethreaded';
   }
 
+  // `architecture` keeps matching the manifest, which only knows real
+  // architectures; the tool cache additionally gets an OS suffix when asked.
+  const scopeSuffix = await getToolCacheScopeSuffix();
+  const cacheArchitecture = scopeSuffix
+    ? `${architecture}-${scopeSuffix}`
+    : architecture;
+
   if (checkLatest) {
     manifest = await installer.getManifest();
     const resolvedVersion = (
@@ -102,7 +114,7 @@ export async function useCpythonVersion(
   let installDir: string | null = tc.find(
     'Python',
     semanticVersionSpec,
-    architecture
+    cacheArchitecture
   );
   if (!installDir) {
     core.info(
@@ -116,9 +128,12 @@ export async function useCpythonVersion(
 
     if (foundRelease && foundRelease.files && foundRelease.files.length > 0) {
       core.info(`Version ${semanticVersionSpec} is available for downloading`);
-      await installer.installCpythonFromRelease(foundRelease);
+      await installer.installCpythonFromRelease(
+        foundRelease,
+        cacheArchitecture
+      );
 
-      installDir = tc.find('Python', semanticVersionSpec, architecture);
+      installDir = tc.find('Python', semanticVersionSpec, cacheArchitecture);
     }
   }
 

@@ -99901,6 +99901,35 @@ async function getOSInfo() {
     }
 }
 /**
+ * Suffix appended to the tool cache architecture directory so that Python
+ * builds for different Linux distributions live side by side, e.g.
+ * `x64-ubuntu-24.04`. Returns '' when scoping does not apply, which leaves the
+ * cache layout unchanged.
+ *
+ * Only Linux needs this: `actions/python-versions` publishes a separate Linux
+ * artifact per distro release because those builds link against distro
+ * specific glibc and OpenSSL, while macOS and Windows publish one artifact per
+ * architecture. GitHub-hosted runners are excluded because their tool cache is
+ * pre-baked to match the host image, so scoping would miss every pre-installed
+ * version.
+ */
+async function getToolCacheScopeSuffix() {
+    if (!getBooleanInput('scope-cache-by-os') ||
+        !IS_LINUX ||
+        process.env['RUNNER_ENVIRONMENT'] === 'github-hosted') {
+        return '';
+    }
+    // getOSInfo() resolves to undefined if the lookup throws, and VERSION_ID is
+    // absent from /etc/os-release on some minimal images.
+    const osInfo = await getOSInfo();
+    if (!osInfo?.osName || !osInfo.osVersion)
+        return '';
+    // The suffix becomes a directory name; `.` is kept for versions like 24.04.
+    return `${osInfo.osName}-${osInfo.osVersion}`
+        .toLowerCase()
+        .replace(/[^a-z0-9.-]+/g, '-');
+}
+/**
  * Extract a value from an object by following the keys path provided.
  * If the value is present, it is returned. Otherwise undefined is returned.
  */
@@ -101229,7 +101258,58 @@ async function installPython(workingDirectory) {
         await exec_exec('bash', ['./setup.sh'], options);
     }
 }
-async function installCpythonFromRelease(release) {
+/**
+ * Installs into an OS-scoped architecture directory, so builds for different
+ * distributions live as siblings under the same version directory:
+ * `Python/3.11.9/x64-ubuntu-24.04` next to `Python/3.11.9/x64-rhel-9`, each
+ * with its own `.complete` marker so one is never resolved for the other.
+ *
+ * `actions/python-versions`' setup script hardcodes the architecture directory
+ * it writes to and clears the version directory on every install, so the
+ * already-installed scoped siblings are stashed beforehand, restored after,
+ * and the freshly written `<arch>/` is renamed to its scoped name.
+ */
+async function installPythonScoped(workingDirectory, sourceArch, cacheArch, version) {
+    const root = process.env['AGENT_TOOLSDIRECTORY'] || process.env['RUNNER_TOOL_CACHE'];
+    if (!root) {
+        throw new Error('Neither AGENT_TOOLSDIRECTORY nor RUNNER_TOOL_CACHE is set, so the tool cache location is unknown.');
+    }
+    const versionDir = external_path_.join(root, 'Python', version);
+    const stash = external_path_.join(root, `.stash-${process.pid}-${Date.now()}`);
+    // Only scoped siblings are stashed; a plain `x64/` is left alone because the
+    // setup script overwrites exactly that directory.
+    const siblings = external_fs_namespaceObject.existsSync(versionDir)
+        ? external_fs_namespaceObject.readdirSync(versionDir).filter(e => e.startsWith(`${sourceArch}-`))
+        : [];
+    try {
+        if (siblings.length) {
+            external_fs_namespaceObject.mkdirSync(stash, { recursive: true });
+            for (const entry of siblings) {
+                external_fs_namespaceObject.renameSync(external_path_.join(versionDir, entry), external_path_.join(stash, entry));
+            }
+        }
+        await installPython(workingDirectory);
+        const installed = external_path_.join(versionDir, sourceArch);
+        const dest = external_path_.join(versionDir, cacheArch);
+        // Clear the marker first so a crash mid-rename leaves a directory that
+        // tool-cache ignores rather than one advertised as usable.
+        external_fs_namespaceObject.rmSync(`${dest}.complete`, { force: true });
+        external_fs_namespaceObject.rmSync(dest, { recursive: true, force: true });
+        external_fs_namespaceObject.renameSync(installed, dest);
+        external_fs_namespaceObject.renameSync(`${installed}.complete`, `${dest}.complete`);
+        info(`Installed Python ${version} into ${dest}`);
+    }
+    finally {
+        for (const entry of siblings) {
+            const stashed = external_path_.join(stash, entry);
+            if (external_fs_namespaceObject.existsSync(stashed)) {
+                external_fs_namespaceObject.renameSync(stashed, external_path_.join(versionDir, entry));
+            }
+        }
+        external_fs_namespaceObject.rmSync(stash, { recursive: true, force: true });
+    }
+}
+async function installCpythonFromRelease(release, cacheArchitecture) {
     if (!release.files || release.files.length === 0) {
         throw new Error('No files found in the release to download.');
     }
@@ -101248,7 +101328,16 @@ async function installCpythonFromRelease(release) {
             pythonExtractedFolder = await tool_cache_extractTar(pythonPath);
         }
         info('Execute installation script');
-        await installPython(pythonExtractedFolder);
+        // The bundled setup script hardcodes the architecture directory it writes
+        // to, so an OS-scoped destination has to be produced by renaming the
+        // finished install rather than by configuring the script.
+        const sourceArchitecture = release.files[0].arch;
+        if (cacheArchitecture && cacheArchitecture !== sourceArchitecture) {
+            await installPythonScoped(pythonExtractedFolder, sourceArchitecture, cacheArchitecture, release.version);
+        }
+        else {
+            await installPython(pythonExtractedFolder);
+        }
     }
     catch (err) {
         if (err instanceof HTTPError) {
@@ -101325,6 +101414,12 @@ async function useCpythonVersion(version, architecture, updateEnvironment, check
         core_debug(`Using freethreaded version of ${semanticVersionSpec}`);
         architecture += '-freethreaded';
     }
+    // `architecture` keeps matching the manifest, which only knows real
+    // architectures; the tool cache additionally gets an OS suffix when asked.
+    const scopeSuffix = await getToolCacheScopeSuffix();
+    const cacheArchitecture = scopeSuffix
+        ? `${architecture}-${scopeSuffix}`
+        : architecture;
     if (checkLatest) {
         manifest = await getManifest();
         const resolvedVersion = (await findReleaseFromManifest(semanticVersionSpec, architecture, manifest))?.version;
@@ -101336,14 +101431,14 @@ async function useCpythonVersion(version, architecture, updateEnvironment, check
             info(`Failed to resolve version ${semanticVersionSpec} from manifest`);
         }
     }
-    let installDir = find('Python', semanticVersionSpec, architecture);
+    let installDir = find('Python', semanticVersionSpec, cacheArchitecture);
     if (!installDir) {
         info(`Version ${semanticVersionSpec} was not found in the local cache`);
         const foundRelease = await findReleaseFromManifest(semanticVersionSpec, architecture, manifest);
         if (foundRelease && foundRelease.files && foundRelease.files.length > 0) {
             info(`Version ${semanticVersionSpec} is available for downloading`);
-            await installCpythonFromRelease(foundRelease);
-            installDir = find('Python', semanticVersionSpec, architecture);
+            await installCpythonFromRelease(foundRelease, cacheArchitecture);
+            installDir = find('Python', semanticVersionSpec, cacheArchitecture);
         }
     }
     if (!installDir) {
